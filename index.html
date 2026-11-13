@@ -6,13 +6,19 @@
 <title>REEVA</title>
 <style>
 html,body{margin:0;height:100%;background:#FBF8EA;color:#0B2447;font-family:system-ui,-apple-system,'Segoe UI',sans-serif}
-#rv{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;font-size:18px;text-align:center;padding:0 24px}
+#rv{display:none;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;font-size:18px;text-align:center;padding:0 24px}
 #rv b{font-size:22px;letter-spacing:.5px;color:#00387A}
-.sp{width:34px;height:34px;border:4px solid #9FB6D9;border-top-color:#00387A;border-radius:50%;animation:r 1s linear infinite}
-@keyframes r{to{transform:rotate(360deg)}}
 button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387A;background:#00387A;color:#fff}
+/* M4 โครงกระดูกตอนโหลด / loading skeleton (หน้าตาเดียวกับในแอป) */
+#sk{padding:0 0 16px}
+#sk .skh{background:#003B7A;color:#fff;padding:18px 16px 14px;border-radius:0 0 18px 18px;border-bottom:4px solid #F7D46B}
+#sk .skh b{display:block;font-size:20px;letter-spacing:.5px}
+#sk .skh span{font-size:14px;opacity:.85}
+#sk .skb{height:84px;margin:14px 12px 0;border-radius:16px;background:#E3E8F0;animation:skp 1.2s ease-in-out infinite}
+@keyframes skp{0%,100%{opacity:1}50%{opacity:.45}}
 </style></head>
-<body><div id="rv"><b>REEVA</b><div class="sp"></div><div>กำลังโหลด / Loading…</div></div>
+<body><div id="sk"><div class="skh"><b>REEVA</b><span>กำลังโหลด... / Loading...</span></div><div class="skb"></div><div class="skb"></div><div class="skb"></div></div>
+<div id="rv"></div>
 <script>
 (function () {
   // ตัวโหลดเล็ก REEVA · แคชตัวหน้าแอปไว้ในเครื่อง เปิดซ้ำขึ้นทันที / tiny loader: caches the app shell on the device
@@ -20,7 +26,9 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   var T0 = Date.now();
   var P = new URLSearchParams(location.search), H = new URLSearchParams(location.hash.replace(/^#/, ''));
   function g(n) { return H.get(n) || P.get(n) || ''; }
-  var KEY = g('k'), VIEW = g('v') || 'mjobs', HSEL = g('h'), SEC = g('s');
+  // VIEW ว่างได้ = ให้เลือกหน้าแรกตามบทบาทตอนเปิด (M4.2) / empty = pick home page by role at boot
+  var KEY = g('k'), VIEW = g('v'), HSEL = g('h'), SEC = g('s');
+  var HOME = { manager: 'minbox', ceo: 'mceo', admin: 'minbox', owner: 'ohome' };
   var GD = /^\d{4}-\d{2}-\d{2}$/.test(g('d')) ? g('d') : '';
   var root = document.getElementById('rv');
 
@@ -32,6 +40,8 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     try { var del = [], i, k; for (i = 0; i < localStorage.length; i++) { k = localStorage.key(i); if (k && k.indexOf('rv_c_') === 0) del.push(k); } del.forEach(function (x) { localStorage.removeItem(x); }); } catch (e) {}
   }
   function show(msg, retry) {
+    var sk = document.getElementById('sk'); if (sk) sk.style.display = 'none';
+    root.style.display = 'flex';
     root.innerHTML = '<b>REEVA</b><div></div>' + (retry ? '<button id="rb">ลองอีกครั้ง / Retry</button>' : '');
     root.children[1].textContent = msg;
     if (retry) document.getElementById('rb').onclick = function () { location.reload(); };
@@ -66,7 +76,8 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   };
 
   function boot(html, role) {
-    var pre = '<script>var KEY=' + JSON.stringify(KEY) + ';var VIEW=' + JSON.stringify(VIEW) + ';var HSEL=' + JSON.stringify(HSEL) +
+    var vw = VIEW || HOME[role] || 'mjobs';
+    var pre = '<script>var KEY=' + JSON.stringify(KEY) + ';var VIEW=' + JSON.stringify(vw) + ';var HSEL=' + JSON.stringify(HSEL) +
       ';var SEC=' + JSON.stringify(SEC) + ';var GD=' + JSON.stringify(GD) + ';var ROLE=' + JSON.stringify(role || '') + ';window.REEVA_T0=' + T0 + ';<\/script>';
     var out = html.replace('<base target="_top">', function (m) { return m + pre; });
     document.open(); document.write(out); document.close();
