@@ -92,10 +92,21 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     lsSet('rv_role', JSON.stringify({ k: KEY, role: j.role || '' }));
   }
 
+  // แอดมินตัวจริง (ไม่ใช่โค้ด va.) → ไปหลังบ้านหน้าเดียวทันที / real admin (not a View-as va. code) goes straight to the back office
+  function adminGo(role) {
+    if (role !== 'admin' || KEY.indexOf('va.') === 0 || g('noadm') === '1') return false;
+    var M = { '': 'dash', minbox: 'dash', mpend: 'apv', mcal: 'cal' }, t = Object.prototype.hasOwnProperty.call(M, VIEW) ? M[VIEW] : 'apps';
+    var go = (t === 'apps' && VIEW) ? '&go=' + encodeURIComponent(VIEW.replace(/[^a-z0-9_]/gi, '').slice(0, 20)) : '';
+    try { document.documentElement.style.display = 'none'; } catch (e) {}
+    location.replace(EXEC + '?page=admin&t=' + t + '&k=' + encodeURIComponent(KEY) + go);
+    return true;
+  }
+
   var cs = null, cr = null;
   try { cs = JSON.parse(lsGet('rv_shell') || 'null'); } catch (e) { cs = null; }
   try { cr = JSON.parse(lsGet('rv_role') || 'null'); } catch (e) { cr = null; }
 
+  if (cr && cr.k === KEY && adminGo(cr.role)) return;
   if (cs && cs.h && cr && cr.k === KEY) {
     var go = function () { boot(cs.h, cr.role); }; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(go, 0); }); else setTimeout(go, 0); // repeat open: wait until parser is done, else document.open is ignored
     // เช็กเวอร์ชันใหม่เงียบๆ หลังหน้าขึ้นแล้ว (ใช้ครั้งถัดไป) / silently check for a newer shell
@@ -104,6 +115,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     // เปิดครั้งแรกของเครื่อง: ต้องดึงตัวหน้าจาก Apps Script (~2–3 วิ) / first open on this device
     fetchShell(cs && cs.h ? cs.v : '').then(function (j) {
       save(j);
+      if (adminGo(j.role)) return;
       var html = j.h || (cs && cs.h) || '';
       if (!html) { show('โหลดไม่สำเร็จ / Could not load', true); return; }
       boot(html, j.role);
