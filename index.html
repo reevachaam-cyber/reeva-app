@@ -21,7 +21,8 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
 <div id="rv"></div>
 <script>
 (function () {
-  // ตัวโหลดเล็ก REEVA · แคชตัวหน้าแอปไว้ในเครื่อง เปิดซ้ำขึ้นทันที / tiny loader: caches the app shell on the device
+  // ตัวโหลดเล็ก REEVA v2 (18 พ.ย.) · แคชตัวหน้าแอปในเครื่อง + ดึงข้อมูลหน้าแรก "พร้อมกัน" กับตัวหน้าแอป + จำบทบาทของทุกคีย์ที่เคยเปิด
+  // tiny loader v2: caches the app shell, prefetches home data IN PARALLEL with the shell, remembers the role of every key opened before
   var EXEC = 'https://script.google.com/macros/s/AKfycbxNnGCJFKM_3-qrYSlkwTGeu71aF_VXMXxUcy9SJsvS7xY59uPyBm-aYE9GLJW03x5_/exec';
   var T0 = Date.now();
   var P = new URLSearchParams(location.search), H = new URLSearchParams(location.hash.replace(/^#/, ''));
@@ -47,7 +48,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     if (retry) document.getElementById('rb').onclick = function () { location.reload(); };
   }
 
-  if (g('r') === '1') { clearSwr(); lsDel('rv_shell'); lsDel('rv_role'); }
+  if (g('r') === '1') { clearSwr(); lsDel('rv_shell'); lsDel('rv_role'); lsDel('rv_roles'); }
   if (!KEY) { show('ลิงก์ไม่ถูกต้อง / Invalid link'); return; }
 
   var SWR = { winOwnerHome: 1 };
@@ -58,8 +59,49 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
       .then(function (r) { return r.json(); })
       .then(function (j) { if (!j || !j.ok) throw new Error((j && j.e) || 'error'); return j.d; }, function () { throw new Error('เชื่อมต่อไม่ได้ / Connection failed'); });
   }
+
+  // ---- รู้บทบาทของคีย์นี้จากครั้งก่อนไหม / do we already know this key's role? ----
+  var KH = hash(KEY);
+  var cs = null, cr = null, rmap = null;
+  try { cs = JSON.parse(lsGet('rv_shell') || 'null'); } catch (e) { cs = null; }
+  try { cr = JSON.parse(lsGet('rv_role') || 'null'); } catch (e) { cr = null; }
+  try { rmap = JSON.parse(lsGet('rv_roles') || 'null'); } catch (e) { rmap = null; }
+  if (!rmap || typeof rmap !== 'object') rmap = {};
+  var knownRole = (cr && cr.k === KEY) ? (cr.role || '') : (Object.prototype.hasOwnProperty.call(rmap, KH) ? String(rmap[KH]) : null);
+  function rememberRole(role) {
+    rmap[KH] = role || '';
+    var ks = Object.keys(rmap); if (ks.length > 12) { delete rmap[ks[0]]; } // กันบวม / cap size
+    lsSet('rv_roles', JSON.stringify(rmap));
+  }
+
+  // ---- ดึงข้อมูลหน้าแรก "พร้อมกัน" กับตัวหน้าแอป (ประหยัดไป 1 รอบเรียก Apps Script ~2.5–4 วิ) ----
+  // prefetch the home page data in parallel with the shell (saves one Apps Script round trip, ~2.5-4 s)
+  // วิวไหนเรียกฟังก์ชันอะไร (ต้องตรงกับในแอปทุกตัวอักษร ถ้าไม่ตรงก็แค่ไม่ได้ใช้ ไม่พัง) / view -> [fn, args] (must match the app; a mismatch just means no benefit)
+  var PFMAP = { mjobs: ['winJobs', ['']], minbox: ['winInbox', []], mlead: ['winLead', ['']], mceo: ['winCeo', []], mtoday: ['winToday', []], ohome: ['winOwnerHome', [HSEL]] };
+  var pfView = VIEW || (knownRole !== null ? (HOME[knownRole] || 'mjobs') : '');
+  var PF = null;
+  // แอดมินตัวจริงจะถูกเด้งไปหลังบ้านอยู่แล้ว ไม่ต้องดึง / real admins are redirected to the back office, no prefetch
+  if (pfView && PFMAP[pfView] && KEY.indexOf('va.') !== 0 && !(knownRole === 'admin' && g('noadm') !== '1')) {
+    PF = { fn: PFMAP[pfView][0], a: PFMAP[pfView][1], used: 0 };
+    PF.p = call(PF.fn, PF.a); PF.p.catch(function () {}); // กัน unhandled / avoid unhandled rejection
+  }
+
   window.REEVA_API = function (fn, a) {
     var done = WRITES[fn] ? function (d) { clearSwr(); return d; } : function (d) { return d; };
+    if (PF && !PF.used && PF.fn === fn && JSON.stringify(PF.a) === JSON.stringify(a)) {
+      PF.used = 1;
+      var pp = PF.p;
+      if (SWR[fn]) {
+        var ck0 = 'rv_c_' + fn + '_' + hash(KEY + '|' + JSON.stringify(a)), raw0 = lsGet(ck0), cached0 = null;
+        if (raw0) { try { cached0 = JSON.parse(raw0); } catch (e) { cached0 = null; } }
+        if (cached0) {
+          pp.then(function (d) { var s = JSON.stringify(d); if (s !== raw0) { lsSet(ck0, s); if (window.REEVA_FRESH) window.REEVA_FRESH(fn, a, d); } }).catch(function () {});
+          return Promise.resolve(cached0);
+        }
+        return pp.then(function (d) { lsSet(ck0, JSON.stringify(d)); return d; }, function () { return call(fn, a); });
+      }
+      return pp.then(done, function () { return call(fn, a).then(done); }); // ดึงล่วงหน้าพลาด = เรียกใหม่ตามปกติ / prefetch failed = normal call
+    }
     if (SWR[fn]) {
       var ck = 'rv_c_' + fn + '_' + hash(KEY + '|' + JSON.stringify(a)), raw = lsGet(ck), cached = null;
       if (raw) { try { cached = JSON.parse(raw); } catch (e) { cached = null; } }
@@ -87,9 +129,10 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
       .then(function (r) { return r.json(); })
       .then(function (j) { if (!j || !j.ok) throw new Error((j && j.e) || 'error'); return j; }, function () { throw new Error('เชื่อมต่อไม่ได้ / Connection failed'); });
   }
-  function save(j, have) {
+  function save(j) {
     if (j.h) lsSet('rv_shell', JSON.stringify({ v: j.v, h: j.h }));
     lsSet('rv_role', JSON.stringify({ k: KEY, role: j.role || '' }));
+    rememberRole(j.role);
   }
 
   // แอดมินตัวจริง (ไม่ใช่โค้ด va.) → ไปหลังบ้านหน้าเดียวทันที / real admin (not a View-as va. code) goes straight to the back office
@@ -102,17 +145,15 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     return true;
   }
 
-  var cs = null, cr = null;
-  try { cs = JSON.parse(lsGet('rv_shell') || 'null'); } catch (e) { cs = null; }
-  try { cr = JSON.parse(lsGet('rv_role') || 'null'); } catch (e) { cr = null; }
-
-  if (cr && cr.k === KEY && adminGo(cr.role)) return;
-  if (cs && cs.h && cr && cr.k === KEY) {
-    var go = function () { boot(cs.h, cr.role); }; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(go, 0); }); else setTimeout(go, 0); // repeat open: wait until parser is done, else document.open is ignored
+  if (knownRole !== null && adminGo(knownRole)) return;
+  if (cs && cs.h && knownRole !== null) {
+    // เปิดซ้ำ หรือสลับกลับมาคีย์ที่เคยเปิด: ขึ้นทันทีจากแคช (ไม่ต้องรอเซิร์ฟเวอร์) / repeat open or switching back to a known key: instant from cache
+    var go = function () { boot(cs.h, knownRole); }; if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(go, 0); }); else setTimeout(go, 0); // repeat open: wait until parser is done, else document.open is ignored
     // เช็กเวอร์ชันใหม่เงียบๆ หลังหน้าขึ้นแล้ว (ใช้ครั้งถัดไป) / silently check for a newer shell
     setTimeout(function () { fetchShell(cs.v).then(function (j) { save(j); }).catch(function () {}); }, 4000);
   } else {
-    // เปิดครั้งแรกของเครื่อง: ต้องดึงตัวหน้าจาก Apps Script (~2–3 วิ) / first open on this device
+    // เปิดครั้งแรกของคีย์นี้ในเครื่อง: ต้องรู้บทบาท (ตัวหน้าแอปถ้ายังไม่มีก็ดึงมาด้วย) — ข้อมูลหน้าแรกวิ่งขนานกันอยู่แล้ว
+    // first open of this key on this device: need the role (and the shell if not cached yet) — home data is already running in parallel
     fetchShell(cs && cs.h ? cs.v : '').then(function (j) {
       save(j);
       if (adminGo(j.role)) return;
