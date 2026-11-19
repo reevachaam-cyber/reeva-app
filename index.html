@@ -21,8 +21,10 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
 <div id="rv"></div>
 <script>
 (function () {
-  // ตัวโหลดเล็ก REEVA v2 (18 พ.ย.) · แคชตัวหน้าแอปในเครื่อง + ดึงข้อมูลหน้าแรก "พร้อมกัน" กับตัวหน้าแอป + จำบทบาทของทุกคีย์ที่เคยเปิด
-  // tiny loader v2: caches the app shell, prefetches home data IN PARALLEL with the shell, remembers the role of every key opened before
+  // ตัวโหลดเล็ก REEVA v3 (19 พ.ย.) · = v2 + ประตูเครื่อง (device gate / อนุญาตเครื่องใหม่ผ่าน LINE)
+  // tiny loader v3: v2 + device gate. When the server answers [DEVICE_NEW] it shows "waiting for approval in LINE", polls every 3 s,
+  // stores the device token (localStorage + cookie, 180 days) and sends it as K~token on every call. Same flow as the in-app (HtmlService) pages.
+  // v2 features kept: caches the app shell, prefetches home data IN PARALLEL with the shell, remembers the role of every key opened before.
   var EXEC = 'https://script.google.com/macros/s/AKfycbxNnGCJFKM_3-qrYSlkwTGeu71aF_VXMXxUcy9SJsvS7xY59uPyBm-aYE9GLJW03x5_/exec';
   var T0 = Date.now();
   var P = new URLSearchParams(location.search), H = new URLSearchParams(location.hash.replace(/^#/, ''));
@@ -48,17 +50,125 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     if (retry) document.getElementById('rb').onclick = function () { location.reload(); };
   }
 
+  // ?r=1 = ล้างแคชหน้า/บทบาท (ไม่ล้าง device token เด็ดขาด / never clears the device token)
   if (g('r') === '1') { clearSwr(); lsDel('rv_shell'); lsDel('rv_role'); lsDel('rv_roles'); }
   if (!KEY) { show('ลิงก์ไม่ถูกต้อง / Invalid link'); return; }
 
   var SWR = { winOwnerHome: 1 };
   var WRITES = { winOwnerSlip: 1, winOwnerRequest: 1, winGuestNotice: 1, winGnUpdate: 1, winGnCancel: 1 };
 
-  function call(fn, a) {
-    return fetch(EXEC + '?page=api', { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ fn: fn, k: KEY, a: a }) })
+  // =====================================================================
+  // ประตูเครื่อง / device gate (v205-sec ฝั่งเซิร์ฟเวอร์ · เก็บ token ฝั่งเครื่องนี้)
+  // =====================================================================
+  var DKEY = 'rv_dt_' + hash(KEY), QKEY = 'rv_dq_' + hash(KEY), MEM = '', busy = null, cur = null;
+  function ckGet(n) { try { var a = document.cookie.split('; '), i; for (i = 0; i < a.length; i++) { if (a[i].indexOf(n + '=') === 0) return decodeURIComponent(a[i].slice(n.length + 1)); } } catch (e) {} return ''; }
+  function ckSet(n, v) { try { document.cookie = n + '=' + (v ? encodeURIComponent(v) : '') + '; path=/; max-age=' + (v ? 15552000 : 0) + '; SameSite=Lax; Secure'; } catch (e) {} }
+  function okTok(t) { return !!t && t.length === 48 && !/[^0-9a-f]/.test(t); }
+  function dtGet() { var t = MEM || lsGet(DKEY) || ckGet(DKEY) || ''; return okTok(t) ? t : ''; }
+  function dtSave(t) { MEM = t || ''; if (t) { lsSet(DKEY, t); ckSet(DKEY, t); } else { lsDel(DKEY); ckSet(DKEY, ''); } }
+  // คีย์ที่ส่งไปเซิร์ฟเวอร์: K หรือ K~token · โค้ด View as (va.) ไม่ใช้ token / wire key: K or K~token (View-as va. codes never carry one)
+  function wireKey() { var t = KEY.indexOf('va.') === 0 ? '' : dtGet(); return t ? KEY + '~' + t : KEY; }
+  function isNew(e) { return String((e && e.message) || e || '').indexOf('[DEVICE_NEW]') >= 0; }
+  function msgOf(e) { return String((e && e.message) || e || '').replace(/^Error: /, ''); }
+  function el(t, st, tx) { var e = document.createElement(t); if (st) { e.style.cssText = st; } if (tx != null) { e.textContent = tx; } return e; }
+  function lab() {
+    var u = String((window.navigator && window.navigator.userAgent) || '');
+    var os = /iPhone|iPad|iPod/.test(u) ? 'iOS' : /Android/.test(u) ? 'Android' : /Windows/.test(u) ? 'Windows' : /Mac OS X|Macintosh/.test(u) ? 'macOS' : /Linux/.test(u) ? 'Linux' : 'Other';
+    var br = /Line\//.test(u) ? 'LINE' : /EdgA?\//.test(u) ? 'Edge' : /OPR\/|Opera/.test(u) ? 'Opera' : /SamsungBrowser/.test(u) ? 'Samsung' : /Firefox|FxiOS/.test(u) ? 'Firefox' : /CriOS|Chrome/.test(u) ? 'Chrome' : /Safari/.test(u) ? 'Safari' : 'Browser';
+    return os + ' · ' + br;
+  }
+  function dgUi() {
+    var o = document.getElementById('dgov');
+    if (!o) {
+      o = el('div', 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483000;background:#FBF8EA;display:flex;align-items:center;justify-content:center;padding:20px;font-family:system-ui,sans-serif');
+      o.id = 'dgov';
+      var c = el('div', 'max-width:380px;width:100%;background:#fff;border:1px solid #D9E2EF;border-radius:16px;padding:22px;text-align:center;color:#00387A');
+      var i = el('div', 'font-size:34px', ''); i.id = 'dgi';
+      var t = el('div', 'font-size:17px;font-weight:700;margin:8px 0 4px;white-space:pre-line', ''); t.id = 'dgt';
+      var s = el('div', 'font-size:13px;color:#52607A;line-height:1.5;white-space:pre-line', ''); s.id = 'dgs';
+      var b = el('div', 'margin-top:14px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap'); b.id = 'dgb';
+      c.appendChild(i); c.appendChild(t); c.appendChild(s); c.appendChild(b); o.appendChild(c);
+      (document.body || document.documentElement).appendChild(o);
+    }
+    return o;
+  }
+  function dgShow(ic, ti, su, btns) {
+    cur = [ic, ti, su, btns];
+    dgUi();
+    document.getElementById('dgi').textContent = ic; document.getElementById('dgt').textContent = ti; document.getElementById('dgs').textContent = su;
+    var b = document.getElementById('dgb'); while (b.firstChild) { b.removeChild(b.firstChild); }
+    (btns || []).forEach(function (x) {
+      var bt = el('button', 'border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:700;' + (x[2] ? 'background:#00387A;color:#fff' : 'background:#E8EDF5;color:#00387A'), x[0]);
+      bt.onclick = x[1]; b.appendChild(bt);
+    });
+  }
+  function dgHide() { cur = null; var o = document.getElementById('dgov'); if (o && o.parentNode) { o.parentNode.removeChild(o); } }
+  // หน้าถูกเขียนทับด้วย document.write ตอนเปิดแอป → วาดหน้ารออีกครั้ง / the page is replaced by document.write at boot -> redraw the waiting screen
+  function dgRedraw() { if (cur && !document.getElementById('dgov')) { dgShow(cur[0], cur[1], cur[2], cur[3]); } }
+
+  function rawCall(fn, a, k) {
+    return fetch(EXEC + '?page=api', { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ fn: fn, k: k, a: a }) })
       .then(function (r) { return r.json(); })
       .then(function (j) { if (!j || !j.ok) throw new Error((j && j.e) || 'error'); return j.d; }, function () { throw new Error('เชื่อมต่อไม่ได้ / Connection failed'); });
   }
+
+  // ขอ + รออนุญาตทาง LINE (ครั้งละ 1 รอบ แม้มีหลายคำสั่งชนกัน) / ask + wait for LINE approval (single flight)
+  function run(ok, no) {
+    var q = null, timer = 0, dead = false;
+    try { q = JSON.parse(lsGet(QKEY) || 'null'); } catch (e) { q = null; }
+    if (q && (!q.id || !q.n || Number(q.exp) < Date.now())) { q = null; }
+    function fin(good, e) { dead = true; if (timer) { clearTimeout(timer); } lsDel(QKEY); dgHide(); if (good) { ok(); } else { no(e); } }
+    function cancel() { fin(false, new Error('ยกเลิก / Cancelled')); }
+    function ask() {
+      dgShow('⏳', 'รอเจ้าของอนุญาตทาง LINE\nWaiting for approval in LINE', 'กำลังส่งคำขอ… / Sending request…', [['ยกเลิก / Cancel', cancel]]);
+      rawCall('dgRequest', [{ l: lab(), p: 'loader:' + (VIEW || 'home') }], KEY).then(function (r) {
+        if (dead) { return; }
+        q = { id: r.id, n: r.n, exp: r.exp }; lsSet(QKEY, JSON.stringify(q)); wait();
+      }, function (e) {
+        if (dead) { return; }
+        dgShow('⚠️', 'ส่งคำขอไม่สำเร็จ\nCould not send the request', msgOf(e), [['ลองใหม่ / Retry', ask, 1], ['ปิด / Close', cancel]]);
+      });
+    }
+    function wait() {
+      dgShow('⏳', 'รอเจ้าของอนุญาตทาง LINE\nWaiting for approval in LINE', 'เปิด LINE แล้วกด "✅ อนุญาตเครื่องนี้" ในแชท REEVA (ไม่ต้องพิมพ์รหัส)\nOpen LINE and tap "Allow this device" in the REEVA chat (no code needed)', [['ยกเลิก / Cancel', cancel]]);
+      tick();
+    }
+    function again(ic, ti, su) { lsDel(QKEY); q = null; dgShow(ic, ti, su, [['ขอใหม่ / Ask again', ask, 1], ['ปิด / Close', cancel]]); }
+    function tick() {
+      if (dead) { return; }
+      dgRedraw();
+      if (q && Date.now() > Number(q.exp) + 5000) { again('⌛', 'คำขอหมดอายุ\nRequest expired', ''); return; }
+      rawCall('dgPoll', [q.id, q.n], KEY).then(function (r) {
+        if (dead) { return; }
+        if (r && r.st === 'ok' && r.dt) { dtSave(r.dt); fin(true); return; }
+        if (r && r.st === 'wait') { timer = setTimeout(tick, 3000); return; }
+        var st = r ? r.st : '';
+        if (st === 'no') { again('⛔', 'ถูกปฏิเสธ\nDenied', 'เจ้าของกด "ไม่ใช่ฉัน" / The owner tapped "Not me"'); }
+        else if (st === 'exp') { again('⌛', 'คำขอหมดอายุ\nRequest expired', ''); }
+        else { again('⚠️', 'ขอใหม่อีกครั้ง\nPlease ask again', 'คำขอเดิมใช้ต่อไม่ได้ / The previous request cannot be continued'); }
+      }, function () { if (dead) { return; } timer = setTimeout(tick, 5000); });
+    }
+    if (q) { wait(); } else { ask(); }
+  }
+  function approve() {
+    if (busy) { return busy; }
+    busy = new Promise(function (ok, no) { run(ok, no); });
+    busy.then(function () { busy = null; }, function () { busy = null; });
+    return busy;
+  }
+  // noAsk = ดึงล่วงหน้าตอนเปิด: ถ้าเครื่องใหม่ ให้เงียบไว้ก่อน (ยังไม่รู้บทบาท · แอดมินจะถูกเด้งไปหลังบ้านอยู่แล้ว) / boot-time prefetch: stay silent on a new device
+  function call(fn, a, noAsk) {
+    return rawCall(fn, a, wireKey()).catch(function (e) {
+      if (!isNew(e) || noAsk) { throw e; }
+      if (dtGet()) { dtSave(''); } // token เดิมใช้ไม่ได้ (หมดอายุ/ถูกลบ/คีย์ถูกรีเซ็ต) / the old token no longer works
+      return approve().then(function () { return rawCall(fn, a, wireKey()); });
+    });
+  }
+  // ให้หน้าในแอปที่ใช้ window.DG (เช่นปุ่ม "อนุญาตเครื่องนี้") ทำงานได้บนหน้านี้ด้วย / lets in-app code that uses window.DG work here too
+  window.DG = {
+    token: dtGet, w: wireKey, isNew: isNew, approve: approve,
+    call: function (f) { return f().catch(function (e) { if (!isNew(e)) { throw e; } if (dtGet()) { dtSave(''); } return approve().then(function () { return f(); }); }); }
+  };
 
   // ---- รู้บทบาทของคีย์นี้จากครั้งก่อนไหม / do we already know this key's role? ----
   var KH = hash(KEY);
@@ -83,7 +193,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   // แอดมินตัวจริงจะถูกเด้งไปหลังบ้านอยู่แล้ว ไม่ต้องดึง / real admins are redirected to the back office, no prefetch
   if (pfView && PFMAP[pfView] && KEY.indexOf('va.') !== 0 && !(knownRole === 'admin' && g('noadm') !== '1')) {
     PF = { fn: PFMAP[pfView][0], a: PFMAP[pfView][1], used: 0 };
-    PF.p = call(PF.fn, PF.a); PF.p.catch(function () {}); // กัน unhandled / avoid unhandled rejection
+    PF.p = call(PF.fn, PF.a, true); PF.p.catch(function () {}); // กัน unhandled / avoid unhandled rejection (noAsk: เครื่องใหม่ = ไม่ขออนุญาตตอนนี้ รอแอปเรียกจริง)
   }
 
   window.REEVA_API = function (fn, a) {
@@ -100,7 +210,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
         }
         return pp.then(function (d) { lsSet(ck0, JSON.stringify(d)); return d; }, function () { return call(fn, a); });
       }
-      return pp.then(done, function () { return call(fn, a).then(done); }); // ดึงล่วงหน้าพลาด = เรียกใหม่ตามปกติ / prefetch failed = normal call
+      return pp.then(done, function () { return call(fn, a).then(done); }); // ดึงล่วงหน้าพลาด/เครื่องใหม่ = เรียกใหม่ตามปกติ (ขออนุญาตถ้าจำเป็น) / prefetch failed or new device = normal call (asks for approval if needed)
     }
     if (SWR[fn]) {
       var ck = 'rv_c_' + fn + '_' + hash(KEY + '|' + JSON.stringify(a)), raw = lsGet(ck), cached = null;
@@ -123,6 +233,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
       ';var SEC=' + JSON.stringify(SEC) + ';var GD=' + JSON.stringify(GD) + ';var ROLE=' + JSON.stringify(role || '') + ';window.REEVA_T0=' + T0 + ';<\/script>';
     var out = html.replace('<base target="_top">', function (m) { return m + pre; });
     document.open(); document.write(out); document.close();
+    dgRedraw();
   }
   function fetchShell(have) {
     return fetch(EXEC + '?page=shell&k=' + encodeURIComponent(KEY) + (have ? '&have=' + encodeURIComponent(have) : ''))
@@ -135,7 +246,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     rememberRole(j.role);
   }
 
-  // แอดมินตัวจริง (ไม่ใช่โค้ด va.) → ไปหลังบ้านหน้าเดียวทันที / real admin (not a View-as va. code) goes straight to the back office
+  // แอดมินตัวจริง (ไม่ใช่โค้ด va.) → ไปหลังบ้านหน้าเดียวทันที (หน้านั้นมีประตูเครื่องของมันเอง) / real admin (not a View-as va. code) goes straight to the back office (which has its own device gate)
   function adminGo(role) {
     if (role !== 'admin' || KEY.indexOf('va.') === 0 || g('noadm') === '1') return false;
     var M = { '': 'dash', minbox: 'dash', mpend: 'apv', mcal: 'cal' }, t = Object.prototype.hasOwnProperty.call(M, VIEW) ? M[VIEW] : 'apps';
