@@ -21,6 +21,9 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
 <div id="rv"></div>
 <script>
 (function () {
+  // ตัวโหลดเล็ก REEVA v4 (20 พ.ย.) · = v3 + เก็บ token 3 ที่ (localStorage + cookie + IndexedDB, ซ่อมตัวเอง) + แถบ "อนุญาตเครื่องนี้ไว้ก่อน" (ไม่บล็อกการใช้งาน)
+  // tiny loader v4: v3 + the device token is kept in 3 places (localStorage + cookie + IndexedDB, self-repairing, the first command waits for IndexedDB when needed)
+  // + a small non-blocking top bar "Approve this device" for gated roles while device_gate is still 0 (button sends the card to the user's own LINE; dismiss = hidden 24 h).
   // ตัวโหลดเล็ก REEVA v3 (19 พ.ย.) · = v2 + ประตูเครื่อง (device gate / อนุญาตเครื่องใหม่ผ่าน LINE)
   // tiny loader v3: v2 + device gate. When the server answers [DEVICE_NEW] it shows "waiting for approval in LINE", polls every 3 s,
   // stores the device token (localStorage + cookie, 180 days) and sends it as K~token on every call. Same flow as the in-app (HtmlService) pages.
@@ -60,12 +63,62 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   // =====================================================================
   // ประตูเครื่อง / device gate (v205-sec ฝั่งเซิร์ฟเวอร์ · เก็บ token ฝั่งเครื่องนี้)
   // =====================================================================
-  var DKEY = 'rv_dt_' + hash(KEY), QKEY = 'rv_dq_' + hash(KEY), MEM = '', busy = null, cur = null;
+  var DKEY = 'rv_dt_' + hash(KEY), QKEY = 'rv_dq_' + hash(KEY), BXKEY = 'rv_dbx_' + hash(KEY), BOKEY = 'rv_dbo_' + hash(KEY), MEM = '', IDBT = '', busy = null, cur = null, soft = null, bdis = 0, bst = null;
   function ckGet(n) { try { var a = document.cookie.split('; '), i; for (i = 0; i < a.length; i++) { if (a[i].indexOf(n + '=') === 0) return decodeURIComponent(a[i].slice(n.length + 1)); } } catch (e) {} return ''; }
   function ckSet(n, v) { try { document.cookie = n + '=' + (v ? encodeURIComponent(v) : '') + '; path=/; max-age=' + (v ? 15552000 : 0) + '; SameSite=Lax; Secure'; } catch (e) {} }
   function okTok(t) { return !!t && t.length === 48 && !/[^0-9a-f]/.test(t); }
-  function dtGet() { var t = MEM || lsGet(DKEY) || ckGet(DKEY) || ''; return okTok(t) ? t : ''; }
-  function dtSave(t) { MEM = t || ''; if (t) { lsSet(DKEY, t); ckSet(DKEY, t); } else { lsDel(DKEY); ckSet(DKEY, ''); } }
+  // v4: IndexedDB เป็นที่เก็บที่ 3 (ถ้า localStorage/คุกกี้ถูกล้าง ยังกู้ได้) / IndexedDB is the 3rd store
+  function idbOpen(cb) {
+    try {
+      var r = window.indexedDB.open('rvdg', 1);
+      r.onupgradeneeded = function () { try { r.result.createObjectStore('k'); } catch (e) {} };
+      r.onsuccess = function () { cb(r.result); };
+      r.onerror = function () { cb(null); };
+      r.onblocked = function () { cb(null); };
+    } catch (e) { cb(null); }
+  }
+  function idbGet(k, cb) {
+    idbOpen(function (db) {
+      if (!db) { cb(''); return; }
+      try {
+        var q = db.transaction('k', 'readonly').objectStore('k').get(k);
+        q.onsuccess = function () { var v = q.result; try { db.close(); } catch (e) {} cb(typeof v === 'string' ? v : ''); };
+        q.onerror = function () { try { db.close(); } catch (e) {} cb(''); };
+      } catch (e) { try { db.close(); } catch (e2) {} cb(''); }
+    });
+  }
+  function idbSet(k, v) {
+    idbOpen(function (db) {
+      if (!db) { return; }
+      try {
+        var tx = db.transaction('k', 'readwrite'), os = tx.objectStore('k');
+        if (v) { os.put(v, k); } else { os['delete'](k); }
+        tx.oncomplete = function () { try { db.close(); } catch (e) {} };
+        tx.onerror = function () { try { db.close(); } catch (e) {} };
+        tx.onabort = function () { try { db.close(); } catch (e) {} };
+      } catch (e) { try { db.close(); } catch (e2) {} }
+    });
+  }
+  function dtGet() {
+    var c = [MEM, lsGet(DKEY), ckGet(DKEY), IDBT], i;
+    for (i = 0; i < c.length; i++) { if (okTok(c[i] || '')) { return c[i]; } }
+    return '';
+  }
+  function dtSave(t) { MEM = t || ''; IDBT = t || ''; if (t) { lsSet(DKEY, t); ckSet(DKEY, t); idbSet(DKEY, t); } else { lsDel(DKEY); ckSet(DKEY, ''); idbSet(DKEY, ''); } }
+  // READY = รู้แล้วว่ามี token ไหม: ถ้าเจอใน localStorage/คุกกี้ทันที ไม่ต้องรอ · ถ้าไม่เจอ รอ IndexedDB (สูงสุด 900 ms) ก่อนคำสั่งแรก
+  // READY = we know whether a token exists: instant when found in localStorage/cookie, otherwise wait for IndexedDB (max 900 ms) before the first command
+  var READY = new Promise(function (resolve) {
+    var done = false;
+    function fin() { if (done) { return; } done = true; resolve(); }
+    if (dtGet()) { fin(); }
+    else {
+      setTimeout(fin, 900);
+      if (!window.indexedDB) { fin(); }
+      else { idbGet(DKEY, function (v) { if (okTok(v)) { IDBT = v; } fin(); }); }
+    }
+  });
+  // ซ่อมตัวเอง: เจอที่ไหนที่หนึ่ง เขียนให้ครบทั้ง 3 ที่ / self-repair: found in any store -> write all three
+  READY.then(function () { var t = dtGet(); if (t) { dtSave(t); } });
   // คีย์ที่ส่งไปเซิร์ฟเวอร์: K หรือ K~token · โค้ด View as (va.) ไม่ใช้ token / wire key: K or K~token (View-as va. codes never carry one)
   function wireKey() { var t = KEY.indexOf('va.') === 0 ? '' : dtGet(); return t ? KEY + '~' + t : KEY; }
   function isNew(e) { return String((e && e.message) || e || '').indexOf('[DEVICE_NEW]') >= 0; }
@@ -104,7 +157,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   }
   function dgHide() { cur = null; var o = document.getElementById('dgov'); if (o && o.parentNode) { o.parentNode.removeChild(o); } }
   // หน้าถูกเขียนทับด้วย document.write ตอนเปิดแอป → วาดหน้ารออีกครั้ง / the page is replaced by document.write at boot -> redraw the waiting screen
-  function dgRedraw() { if (cur && !document.getElementById('dgov')) { dgShow(cur[0], cur[1], cur[2], cur[3]); } }
+  function dgRedraw() { if (cur && !document.getElementById('dgov')) { dgShow(cur[0], cur[1], cur[2], cur[3]); } barRedraw(); }
 
   function rawCall(fn, a, k) {
     return fetch(EXEC + '?page=api', { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ fn: fn, k: k, a: a }) })
@@ -145,6 +198,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
         var st = r ? r.st : '';
         if (st === 'no') { again('⛔', 'ถูกปฏิเสธ\nDenied', 'เจ้าของกด "ไม่ใช่ฉัน" / The owner tapped "Not me"'); }
         else if (st === 'exp') { again('⌛', 'คำขอหมดอายุ\nRequest expired', ''); }
+        else if (st === 'lost') { timer = setTimeout(function () { if (dead) { return; } if (dtGet()) { fin(true); } else { again('⚠️', 'ขอใหม่อีกครั้ง\nPlease ask again', 'คำขอเดิมใช้ต่อไม่ได้ / The previous request cannot be continued'); } }, 900); } // v4: โทเคนถูกแถบเล็กรับไปแล้ว (มาครั้งเดียว) / the small bar already received the one-time token
         else { again('⚠️', 'ขอใหม่อีกครั้ง\nPlease ask again', 'คำขอเดิมใช้ต่อไม่ได้ / The previous request cannot be continued'); }
       }, function () { if (dead) { return; } timer = setTimeout(tick, 5000); });
     }
@@ -152,13 +206,14 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   }
   function approve() {
     if (busy) { return busy; }
+    softStop();
     busy = new Promise(function (ok, no) { run(ok, no); });
-    busy.then(function () { busy = null; }, function () { busy = null; });
+    busy.then(function () { busy = null; barHide(); }, function () { busy = null; });
     return busy;
   }
   // noAsk = ดึงล่วงหน้าตอนเปิด: ถ้าเครื่องใหม่ ให้เงียบไว้ก่อน (ยังไม่รู้บทบาท · แอดมินจะถูกเด้งไปหลังบ้านอยู่แล้ว) / boot-time prefetch: stay silent on a new device
   function call(fn, a, noAsk) {
-    return rawCall(fn, a, wireKey()).catch(function (e) {
+    return READY.then(function () { return rawCall(fn, a, wireKey()); }).catch(function (e) {
       if (!isNew(e) || noAsk) { throw e; }
       if (dtGet()) { dtSave(''); } // token เดิมใช้ไม่ได้ (หมดอายุ/ถูกลบ/คีย์ถูกรีเซ็ต) / the old token no longer works
       return approve().then(function () { return rawCall(fn, a, wireKey()); });
@@ -167,8 +222,85 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
   // ให้หน้าในแอปที่ใช้ window.DG (เช่นปุ่ม "อนุญาตเครื่องนี้") ทำงานได้บนหน้านี้ด้วย / lets in-app code that uses window.DG work here too
   window.DG = {
     token: dtGet, w: wireKey, isNew: isNew, approve: approve,
-    call: function (f) { return f().catch(function (e) { if (!isNew(e)) { throw e; } if (dtGet()) { dtSave(''); } return approve().then(function () { return f(); }); }); }
+    call: function (f) { return READY.then(function () { return f(); }).catch(function (e) { if (!isNew(e)) { throw e; } if (dtGet()) { dtSave(''); } return approve().then(function () { return f(); }); }); }
   };
+
+  // =====================================================================
+  // v4: แถบขออนุญาตเครื่องล่วงหน้า (ไม่บล็อก) / early device-approval bar (never blocks use)
+  // เงื่อนไข: บทบาทอยู่ในรายการประตูเครื่อง + ยังไม่มี token ที่ใช้ได้ + device_gate=0 (เซิร์ฟเวอร์ตอบผ่าน dgInfo) · ไม่แสดงกับแม่บ้านทั่วไป/เจ้าของ
+  // =====================================================================
+  function dismissedRecently() { var v = Number(lsGet(BXKEY)) || bdis, n = Date.now(); return !!v && v <= n + 60000 && n - v < 86400000; }
+  function softStop() { if (soft) { soft.dead = true; if (soft.timer) { clearTimeout(soft.timer); } soft = null; } }
+  function barSet(text, btns, closable) {
+    bst = { text: text, btns: btns || [], closable: closable !== false };
+    barDraw();
+  }
+  function barDraw() {
+    if (!bst) { return; }
+    var b = document.getElementById('dgbar');
+    if (!b) {
+      b = el('div', 'position:sticky;top:0;left:0;right:0;z-index:2147482000;background:#FFF4CC;color:#00387A;border-bottom:2px solid #F7D46B;padding:7px 10px;font:600 13px/1.35 system-ui,sans-serif;display:flex;align-items:center;gap:8px;flex-wrap:wrap');
+      b.id = 'dgbar';
+      var t = el('span', 'flex:1 1 180px;min-width:0;white-space:pre-line', ''); t.id = 'dgbt';
+      var a = el('span', 'display:flex;gap:6px;align-items:center'); a.id = 'dgba';
+      b.appendChild(t); b.appendChild(a);
+      var p = document.body || document.documentElement;
+      p.insertBefore(b, p.firstChild);
+    }
+    document.getElementById('dgbt').textContent = bst.text;
+    var a2 = document.getElementById('dgba'); while (a2.firstChild) { a2.removeChild(a2.firstChild); }
+    bst.btns.forEach(function (x) {
+      var bt = el('button', 'border:0;border-radius:8px;padding:6px 12px;font-size:13px;font-weight:700;background:#00387A;color:#fff', x[0]);
+      bt.onclick = x[1]; a2.appendChild(bt);
+    });
+    if (bst.closable) {
+      var cx = el('button', 'border:0;border-radius:8px;padding:6px 9px;font-size:13px;font-weight:700;background:#E8EDF5;color:#00387A', '✕');
+      cx.title = 'ซ่อน 24 ชม. / Hide for 24 h'; cx.onclick = barDismiss; a2.appendChild(cx);
+    }
+  }
+  // หน้าถูก document.write ทับตอนเปิดแอป → วาดแถบกลับมา / redraw after the page is replaced at boot
+  function barRedraw() { if (bst && !document.getElementById('dgbar')) { barDraw(); } }
+  function barHide() { bst = null; var b = document.getElementById('dgbar'); if (b && b.parentNode) { b.parentNode.removeChild(b); } }
+  function barDismiss() { bdis = Date.now(); lsSet(BXKEY, String(bdis)); softStop(); barHide(); }
+  function barIdle() {
+    barSet('🔐 ยังไม่ได้อนุญาตเครื่องนี้ — กดอนุญาตไว้ก่อน จะได้ไม่สะดุดทีหลัง\nThis device is not approved yet. Approve it now so nothing is interrupted later.', [['🔐 อนุญาตเครื่องนี้ / Approve this device', barAsk]]);
+  }
+  function barAsk() {
+    softStop();
+    var s = { dead: false, timer: 0, q: null }; soft = s;
+    barSet('⏳ กำลังส่งคำขอไปที่ LINE… / Sending the request to LINE…', [], true);
+    function fail(ti) { lsDel(QKEY); s.q = null; barSet(ti, [['ขอใหม่ / Ask again', barAsk]]); }
+    function tick() {
+      if (s.dead) { return; }
+      if (Date.now() > Number(s.q.exp) + 5000) { fail('⌛ คำขอหมดอายุ / Request expired'); return; }
+      rawCall('dgPoll', [s.q.id, s.q.n], KEY).then(function (r) {
+        // token มาครั้งเดียว: ต่อให้ผู้ใช้เปลี่ยนไปใช้หน้ารอแบบบล็อกแล้ว ก็ต้องเก็บไว้ / the token is delivered only once: keep it even if the blocking flow took over meanwhile
+        if (r && r.st === 'ok' && r.dt) { dtSave(r.dt); lsDel(QKEY); if (s.dead) { return; } soft = null; lsSet(BOKEY, String(Date.now())); barSet('✅ อนุญาตเครื่องนี้แล้ว / This device is approved', [], false); setTimeout(barHide, 4000); return; }
+        if (s.dead) { return; }
+        if (r && r.st === 'wait') { s.timer = setTimeout(tick, 3000); return; }
+        var st = r ? r.st : '';
+        if (st === 'no') { fail('⛔ ถูกปฏิเสธ / Denied'); }
+        else if (st === 'exp') { fail('⌛ คำขอหมดอายุ / Request expired'); }
+        else { fail('⚠️ คำขอเดิมใช้ต่อไม่ได้ / The previous request cannot be continued'); }
+      }, function () { if (s.dead) { return; } s.timer = setTimeout(tick, 5000); });
+    }
+    rawCall('dgRequest', [{ l: lab(), p: 'loader:' + (VIEW || 'home') + ':bar' }], KEY).then(function (r) {
+      if (s.dead) { return; }
+      s.q = { id: r.id, n: r.n, exp: r.exp }; lsSet(QKEY, JSON.stringify(s.q));
+      barSet('⏳ เปิด LINE แล้วกด "✅ อนุญาตเครื่องนี้" ได้เลย (ใช้งานต่อได้ตามปกติ)\nOpen LINE and tap "Allow this device" (you can keep working)', [], true);
+      tick();
+    }, function (e) { if (s.dead) { return; } barSet('⚠️ ' + msgOf(e), [['ลองใหม่ / Retry', barAsk]]); });
+  }
+  function barInit() {
+    try {
+      if (KEY.indexOf('va.') === 0 || busy || dismissedRecently()) { return; }
+      var o = Number(lsGet(BOKEY)) || 0; if (o && Date.now() - o < 21600000 && o <= Date.now() + 60000) { return; }
+      rawCall('dgInfo', [], wireKey()).then(function (r) {
+        if (r && r.bar === 1) { if (!busy && !dismissedRecently() && !document.getElementById('dgov')) { barIdle(); } }
+        else if (r && r.why !== 'err') { lsSet(BOKEY, String(Date.now())); }
+      }, function () {});
+    } catch (e) {}
+  }
 
   // ---- รู้บทบาทของคีย์นี้จากครั้งก่อนไหม / do we already know this key's role? ----
   var KH = hash(KEY);
@@ -234,6 +366,7 @@ button{font:inherit;padding:12px 22px;border-radius:12px;border:2px solid #00387
     var out = html.replace('<base target="_top">', function (m) { return m + pre; });
     document.open(); document.write(out); document.close();
     dgRedraw();
+    READY.then(function () { setTimeout(barInit, 1500); }); // v4: เช็กแถบหลังแอปขึ้น (แอดมินตัวจริงไม่มาถึงตรงนี้ เพราะถูกเด้งไปหลังบ้านก่อน) / check the bar after the app is up
   }
   function fetchShell(have) {
     return fetch(EXEC + '?page=shell&k=' + encodeURIComponent(KEY) + (have ? '&have=' + encodeURIComponent(have) : ''))
